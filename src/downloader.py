@@ -10,7 +10,7 @@ import requests
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
 
-REPO_ID = "AdwolfCzar/looper_v4"
+REPO_ID = "AdwolfCzar/residals_dataset_base_1"
 REPO_TYPE = "dataset"
 REVISION = "main"
 
@@ -18,10 +18,10 @@ log = logging.getLogger(__name__)
 
 
 def _raw_tree() -> list[dict]:
-    """Fetch the chunks/ tree as plain dicts. Separated for easy mocking."""
+    """Fetch the repo root tree as plain dicts. Separated for easy mocking."""
     api = HfApi()
     out: list[dict] = []
-    for entry in api.list_repo_tree(REPO_ID, path_in_repo="chunks", repo_type=REPO_TYPE,
+    for entry in api.list_repo_tree(REPO_ID, repo_type=REPO_TYPE,
                                      revision=REVISION, recursive=False):
         is_dir = entry.__class__.__name__.endswith("Folder")
         out.append({
@@ -33,14 +33,14 @@ def _raw_tree() -> list[dict]:
 
 
 def list_remote_zips() -> list[tuple[str, int]]:
-    """Return [(repo_path, size_bytes), ...] for chunk_*.zip only."""
+    """Return [(repo_path, size_bytes), ...] for *.zip files at repo root."""
     tree = _raw_tree()
     out: list[tuple[str, int]] = []
     for e in tree:
         if e["type"] != "file":
             continue
         p = e["path"]
-        if p.endswith(".zip") and "/chunk_" in p:
+        if p.endswith(".zip"):
             out.append((p, e["size"]))
     return sorted(out)
 

@@ -120,6 +120,19 @@ def test_process_video_truncate_path(synthetic_video_factory, tmp_path):
     assert info.duration <= 5.5  # tolerance for keyframe alignment
 
 
+def test_process_video_without_txt_sibling(synthetic_video_factory, tmp_path):
+    """Datasets without .txt sidecars must produce only the .mp4, no .txt."""
+    src = synthetic_video_factory(fps=30, duration=2.0, with_audio=False, name="e.mp4")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    result = process_video(video=src, txt=None, output_dir=out_dir)
+    out_video = out_dir / result.output_name
+    assert out_video.exists()
+    assert not out_video.with_suffix(".txt").exists()
+    # no leftover hidden tmp files either
+    assert list(out_dir.glob(".*.part.*")) == []
+
+
 def test_process_video_collision_renames_both(synthetic_video_factory, tmp_path):
     src = synthetic_video_factory(fps=30, duration=2.0, with_audio=False, name="d.mp4")
     txt = src.with_suffix(".txt")
