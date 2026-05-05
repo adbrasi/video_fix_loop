@@ -7,3 +7,13 @@ node_modules/
 dist/
 build/
 .vscode/
+
+# runtime artifacts
+outputs/
+work/
+state.db
+state.db-*
+run.log
+*.log
+.pytest_cache/
+run.pid
