@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from src.encoder import _parse_duration, allocate_output_name, decide_action, probe_video, process_video
@@ -37,8 +39,10 @@ def test_parse_duration_handles_na_and_missing():
 
 def test_allocate_output_name_creates_atomic_placeholder(tmp_path):
     name = allocate_output_name(tmp_path, "clip.mp4")
-    # placeholder file MUST exist to block concurrent encoders
-    assert (tmp_path / name).exists()
+    # reservation lives in a hidden .part dotfile, never the visible final path —
+    # otherwise external scanners would see a 0-byte mp4 mid-encode.
+    assert not (tmp_path / name).exists()
+    assert (tmp_path / f".{Path(name).stem}.part.mp4").exists()
 
 
 def test_allocate_output_name_atomic_under_concurrent_calls(tmp_path):
@@ -48,6 +52,9 @@ def test_allocate_output_name_atomic_under_concurrent_calls(tmp_path):
     assert names[0] == "clip.mp4"
     for n in names[1:]:
         assert n.startswith("clip__") and n.endswith(".mp4")
+    # none of the visible final paths are populated yet
+    for n in names:
+        assert not (tmp_path / n).exists()
 
 
 def test_allocate_output_name_no_collision(tmp_path):

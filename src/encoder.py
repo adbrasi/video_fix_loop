@@ -93,10 +93,12 @@ def decide_action(*, fps: float, duration: float) -> str:
 
 
 def allocate_output_name(output_dir: Path, desired: str) -> str:
-    """Atomically reserve a non-colliding filename via O_EXCL.
+    """Atomically reserve a non-colliding filename via O_EXCL on a hidden .part file.
 
-    Creates an empty placeholder so concurrent encoders see it. Caller must overwrite
-    via tmp.replace(). Considers .txt sibling for fallback rename.
+    The reservation is the hidden tmp file `.{stem}.part{ext}` (same path the encoder
+    writes ffmpeg/cp output into), so the visible final filename never appears empty
+    to external scanners. Caller writes into the .part path then atomically renames
+    to the returned candidate.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     p = Path(desired)
@@ -104,13 +106,15 @@ def allocate_output_name(output_dir: Path, desired: str) -> str:
     n = 0
     while True:
         candidate = desired if n == 0 else f"{stem}__{n}{ext}"
+        cand = Path(candidate)
         v = output_dir / candidate
         t = v.with_suffix(".txt")
-        if t.exists():
+        part = output_dir / f".{cand.stem}.part{ext}"
+        if v.exists() or t.exists():
             n += 1
             continue
         try:
-            fd = os.open(str(v), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            fd = os.open(str(part), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         except FileExistsError:
             n += 1
             continue
@@ -157,7 +161,10 @@ def process_video(*, video: Path, txt: Optional[Path], output_dir: Path) -> Enco
     out_video = output_dir / out_name
     out_txt = out_video.with_suffix(".txt")
 
+    # tmp is the same path allocate_output_name reserved via O_EXCL — a 0-byte hidden
+    # placeholder. ffmpeg `-y` and shutil.copyfile both overwrite, so this is safe.
     tmp = out_video.with_name(f".{out_video.stem}.part{out_video.suffix}")
+    tmp_txt = out_video.with_name(f".{out_video.stem}.part.txt")
     try:
         if action == "cp":
             _do_cp(video, tmp)
@@ -171,15 +178,19 @@ def process_video(*, video: Path, txt: Optional[Path], output_dir: Path) -> Enco
                 action = "reencode"
         else:
             _do_reencode(video, tmp, has_audio=info.has_audio)
+
+        # Place txt BEFORE the visible mp4 so any external scanner that triggers on
+        # the mp4 will always find its .txt sibling already in place.
+        if txt is not None and txt.exists():
+            shutil.copyfile(txt, tmp_txt)
+            tmp_txt.replace(out_txt)
         tmp.replace(out_video)
     finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except FileNotFoundError:
-                pass
-
-    if txt is not None and txt.exists():
-        shutil.copyfile(txt, out_txt)
+        for p in (tmp, tmp_txt):
+            if p.exists():
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
 
     return EncodeResult(action=action, output_name=out_name, info=info)
