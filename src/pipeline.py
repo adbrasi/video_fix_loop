@@ -27,7 +27,7 @@ class Config:
     n_extractors: int = 2
     n_encoders: int = 32
     download_queue_max: int = 4
-    encode_queue_max: int = 256
+    encode_queue_max: int = 1024
 
 
 def _signal_handler(stop_event: mp.Event):
