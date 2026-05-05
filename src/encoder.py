@@ -11,8 +11,9 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-MAX_DURATION = 5.0
-TARGET_FPS = 30
+MAX_DURATION = 8.0
+MIN_LEFTOVER_KEEP = 5.0
+TARGET_FPS = 25
 FPS_TOLERANCE = 0.05
 DURATION_TOLERANCE = 0.05
 FFMPEG_TIMEOUT = 300
@@ -27,9 +28,16 @@ class VideoInfo:
 
 
 @dataclass(frozen=True)
+class Segment:
+    index: int
+    start: float
+    length: float
+
+
+@dataclass(frozen=True)
 class EncodeResult:
-    action: str          # cp | stream_copy | reencode
-    output_name: str
+    action: str          # cp | reencode | discarded
+    output_names: list[str]
     info: VideoInfo
 
 
@@ -82,13 +90,41 @@ def probe_video(path: Path) -> VideoInfo:
     return VideoInfo(fps=fps, duration=duration, has_audio=audio is not None)
 
 
+def plan_segments(duration: float) -> list[Segment]:
+    """Plan output segments for a source of given duration.
+
+    Rules:
+      - duration <= 0: return []  (discard)
+      - duration <= MAX_DURATION (+ tol): single segment spanning the whole video
+      - duration  > MAX_DURATION: chunk into MAX_DURATION pieces; final leftover
+        kept only if >= MIN_LEFTOVER_KEEP, else discarded
+    """
+    if duration <= 0:
+        return []
+    if duration <= MAX_DURATION + DURATION_TOLERANCE:
+        return [Segment(index=0, start=0.0, length=duration)]
+    segs: list[Segment] = []
+    pos = 0.0
+    idx = 0
+    while pos + MAX_DURATION <= duration:
+        segs.append(Segment(index=idx, start=pos, length=MAX_DURATION))
+        pos += MAX_DURATION
+        idx += 1
+    leftover = duration - pos
+    if leftover >= MIN_LEFTOVER_KEEP:
+        segs.append(Segment(index=idx, start=pos, length=leftover))
+    return segs
+
+
 def decide_action(*, fps: float, duration: float) -> str:
-    near_30 = abs(fps - TARGET_FPS) <= FPS_TOLERANCE
+    """Action for a single-segment-full-video case.
+
+    For multi-segment videos the encoder always re-encodes (keyframe accuracy on cuts).
+    """
+    near_target = abs(fps - TARGET_FPS) <= FPS_TOLERANCE
     short = duration <= MAX_DURATION + DURATION_TOLERANCE
-    if near_30 and short:
+    if near_target and short:
         return "cp"
-    if near_30 and not short:
-        return "stream_copy"
     return "reencode"
 
 
@@ -131,16 +167,15 @@ def _do_cp(src: Path, dst: Path) -> None:
     shutil.copyfile(src, dst)
 
 
-def _do_stream_copy(src: Path, dst: Path) -> None:
-    _run_ffmpeg(["-i", str(src), "-t", str(MAX_DURATION),
-                 "-c", "copy", "-movflags", "+faststart", str(dst)])
-
-
-def _do_reencode(src: Path, dst: Path, *, has_audio: bool) -> None:
-    args = [
-        "-i", str(src),
+def _do_reencode_segment(src: Path, dst: Path, *, start: float, length: float, has_audio: bool) -> None:
+    """Re-encode a [start, start+length] window of src into dst at TARGET_FPS."""
+    args: list[str] = []
+    if start > 0.0:
+        args += ["-ss", f"{start:.3f}"]
+    args += ["-i", str(src)]
+    args += [
         "-vf", f"fps={TARGET_FPS},scale=trunc(iw/2)*2:trunc(ih/2)*2",
-        "-t", str(MAX_DURATION),
+        "-t", f"{length:.3f}",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-threads", str(LIBX264_THREADS),
         "-pix_fmt", "yuv420p",
@@ -154,33 +189,21 @@ def _do_reencode(src: Path, dst: Path, *, has_audio: bool) -> None:
     _run_ffmpeg(args)
 
 
-def process_video(*, video: Path, txt: Optional[Path], output_dir: Path) -> EncodeResult:
-    info = probe_video(video)
-    action = decide_action(fps=info.fps, duration=info.duration)
-    out_name = allocate_output_name(output_dir, video.name)
+def _emit_one(*, video: Path, txt: Optional[Path], output_dir: Path,
+              dest_basename: str, action: str,
+              start: float, length: float, full_duration: float,
+              has_audio: bool) -> str:
+    """Write one output (cp or reencoded segment) atomically. Returns final name."""
+    out_name = allocate_output_name(output_dir, dest_basename)
     out_video = output_dir / out_name
     out_txt = out_video.with_suffix(".txt")
-
-    # tmp is the same path allocate_output_name reserved via O_EXCL — a 0-byte hidden
-    # placeholder. ffmpeg `-y` and shutil.copyfile both overwrite, so this is safe.
     tmp = out_video.with_name(f".{out_video.stem}.part{out_video.suffix}")
     tmp_txt = out_video.with_name(f".{out_video.stem}.part.txt")
     try:
         if action == "cp":
             _do_cp(video, tmp)
-        elif action == "stream_copy":
-            try:
-                _do_stream_copy(video, tmp)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                if tmp.exists():
-                    tmp.unlink()
-                _do_reencode(video, tmp, has_audio=info.has_audio)
-                action = "reencode"
         else:
-            _do_reencode(video, tmp, has_audio=info.has_audio)
-
-        # Place txt BEFORE the visible mp4 so any external scanner that triggers on
-        # the mp4 will always find its .txt sibling already in place.
+            _do_reencode_segment(video, tmp, start=start, length=length, has_audio=has_audio)
         if txt is not None and txt.exists():
             shutil.copyfile(txt, tmp_txt)
             tmp_txt.replace(out_txt)
@@ -192,5 +215,56 @@ def process_video(*, video: Path, txt: Optional[Path], output_dir: Path) -> Enco
                     p.unlink()
                 except FileNotFoundError:
                     pass
+    return out_name
 
-    return EncodeResult(action=action, output_name=out_name, info=info)
+
+def _rollback_outputs(output_dir: Path, names: list[str]) -> None:
+    """Delete previously-emitted segment outputs (and their .txt siblings)."""
+    for n in names:
+        v = output_dir / n
+        t = v.with_suffix(".txt")
+        for p in (v, t):
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+
+def process_video(*, video: Path, txt: Optional[Path], output_dir: Path) -> EncodeResult:
+    info = probe_video(video)
+    segments = plan_segments(info.duration)
+    if not segments:
+        return EncodeResult(action="discarded", output_names=[], info=info)
+
+    # Single segment that spans the full video → may use cp shortcut
+    if len(segments) == 1 and abs(segments[0].length - info.duration) <= DURATION_TOLERANCE:
+        action = decide_action(fps=info.fps, duration=info.duration)
+        out_name = _emit_one(
+            video=video, txt=txt, output_dir=output_dir,
+            dest_basename=video.name,
+            action=action,
+            start=0.0, length=info.duration, full_duration=info.duration,
+            has_audio=info.has_audio,
+        )
+        return EncodeResult(action=action, output_names=[out_name], info=info)
+
+    # Multi-segment (or partial-window single segment): always reencode each piece
+    src_stem = Path(video.name).stem
+    src_ext = Path(video.name).suffix
+    names: list[str] = []
+    try:
+        for seg in segments:
+            seg_basename = f"{src_stem}_s{seg.index:02d}{src_ext}"
+            name = _emit_one(
+                video=video, txt=txt, output_dir=output_dir,
+                dest_basename=seg_basename,
+                action="reencode",
+                start=seg.start, length=seg.length, full_duration=info.duration,
+                has_audio=info.has_audio,
+            )
+            names.append(name)
+    except Exception:
+        _rollback_outputs(output_dir, names)
+        raise
+    return EncodeResult(action="reencode", output_names=names, info=info)

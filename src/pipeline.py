@@ -111,7 +111,7 @@ def _encoder_loop(cfg: Config, ex_queue: mp.Queue, stop: mp.Event):
             result = process_video(video=video, txt=txt, output_dir=cfg.output_dir)
             db.set_video_done(
                 zip_name, internal,
-                output_name=result.output_name,
+                output_name=",".join(result.output_names),
                 action=result.action,
                 fps_in=result.info.fps,
                 duration_in=result.info.duration,
