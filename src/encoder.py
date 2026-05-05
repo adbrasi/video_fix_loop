@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -14,7 +15,8 @@ MAX_DURATION = 5.0
 TARGET_FPS = 30
 FPS_TOLERANCE = 0.05
 DURATION_TOLERANCE = 0.05
-FFMPEG_TIMEOUT = 120
+FFMPEG_TIMEOUT = 300
+LIBX264_THREADS = 2
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,16 @@ def _parse_fps(rate: str) -> float:
         return 0.0
 
 
+def _parse_duration(raw) -> float:
+    """ffprobe may return 'N/A' or missing duration."""
+    if raw is None:
+        return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def probe_video(path: Path) -> VideoInfo:
     data = _ffprobe_json(path)
     streams = data.get("streams", [])
@@ -66,7 +78,7 @@ def probe_video(path: Path) -> VideoInfo:
         raise ValueError(f"no video stream in {path}")
     fps = _parse_fps(video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/1")
     fmt = data.get("format", {})
-    duration = float(fmt.get("duration") or video.get("duration") or 0.0)
+    duration = _parse_duration(fmt.get("duration")) or _parse_duration(video.get("duration"))
     return VideoInfo(fps=fps, duration=duration, has_audio=audio is not None)
 
 
@@ -81,22 +93,29 @@ def decide_action(*, fps: float, duration: float) -> str:
 
 
 def allocate_output_name(output_dir: Path, desired: str) -> str:
-    """Pick a non-colliding filename in `output_dir`. Considers BOTH .ext and .txt sibling."""
+    """Atomically reserve a non-colliding filename via O_EXCL.
+
+    Creates an empty placeholder so concurrent encoders see it. Caller must overwrite
+    via tmp.replace(). Considers .txt sibling for fallback rename.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     p = Path(desired)
     stem, ext = p.stem, p.suffix
-    candidate_video = output_dir / desired
-    candidate_txt = candidate_video.with_suffix(".txt")
-    if not candidate_video.exists() and not candidate_txt.exists():
-        return desired
-    n = 1
+    n = 0
     while True:
-        new_name = f"{stem}__{n}{ext}"
-        v = output_dir / new_name
+        candidate = desired if n == 0 else f"{stem}__{n}{ext}"
+        v = output_dir / candidate
         t = v.with_suffix(".txt")
-        if not v.exists() and not t.exists():
-            return new_name
-        n += 1
+        if t.exists():
+            n += 1
+            continue
+        try:
+            fd = os.open(str(v), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            n += 1
+            continue
+        os.close(fd)
+        return candidate
 
 
 def _run_ffmpeg(args: list[str]) -> None:
@@ -116,9 +135,10 @@ def _do_stream_copy(src: Path, dst: Path) -> None:
 def _do_reencode(src: Path, dst: Path, *, has_audio: bool) -> None:
     args = [
         "-i", str(src),
-        "-vf", f"fps={TARGET_FPS}",
+        "-vf", f"fps={TARGET_FPS},scale=trunc(iw/2)*2:trunc(ih/2)*2",
         "-t", str(MAX_DURATION),
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-threads", str(LIBX264_THREADS),
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
     ]
@@ -144,7 +164,7 @@ def process_video(*, video: Path, txt: Optional[Path], output_dir: Path) -> Enco
         elif action == "stream_copy":
             try:
                 _do_stream_copy(video, tmp)
-            except subprocess.CalledProcessError:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 if tmp.exists():
                     tmp.unlink()
                 _do_reencode(video, tmp, has_audio=info.has_audio)

@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import requests
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
@@ -61,7 +62,8 @@ def download_zip(repo_path: str, dest_dir: Path, *, max_retries: int = 5) -> Pat
                 local_dir=str(dest_dir),
             )
             return Path(cached)
-        except (HfHubHTTPError, requests.RequestException) as e:
+        except (HfHubHTTPError, requests.RequestException,
+                httpx.TimeoutException, httpx.NetworkError, OSError) as e:
             last_err = e
             backoff = min(60, 2 ** attempt)
             log.warning("download %s failed (attempt %d/%d): %s — retry in %ss",

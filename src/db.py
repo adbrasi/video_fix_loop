@@ -122,12 +122,12 @@ class DB:
                 c.execute("UPDATE zips SET status=? WHERE name=?", (status.value, name))
 
     def reset_stale_zips(self, zip_files_present: set[str]) -> None:
-        """On startup, revert in-flight zip states.
-        - downloading → pending
+        """On startup, revert in-flight zip states so workers re-claim them.
+        - downloading/downloaded → pending (downloader's hf_hub_download is no-op if file exists)
         - extracting/processing → downloaded if zip on disk, else pending
         """
         with self._conn() as c:
-            c.execute("UPDATE zips SET status='pending' WHERE status='downloading'")
+            c.execute("UPDATE zips SET status='pending' WHERE status IN ('downloading','downloaded')")
             for row in c.execute("SELECT name FROM zips WHERE status IN ('extracting','processing')").fetchall():
                 target = "downloaded" if row["name"] in zip_files_present else "pending"
                 c.execute("UPDATE zips SET status=? WHERE name=?", (target, row["name"]))

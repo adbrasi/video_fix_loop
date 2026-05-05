@@ -63,6 +63,8 @@ def _extractor_loop(cfg: Config, dl_queue: mp.Queue, ex_queue: mp.Queue, stop: m
         try:
             item = dl_queue.get(timeout=2)
         except Empty:
+            if stop.is_set():
+                break
             continue
         if item is None:
             break
@@ -94,6 +96,8 @@ def _encoder_loop(cfg: Config, ex_queue: mp.Queue, stop: mp.Event):
         try:
             task = ex_queue.get(timeout=2)
         except Empty:
+            if stop.is_set():
+                break
             continue
         if task is None:
             break
@@ -126,7 +130,20 @@ def _cleaner_loop(cfg: Config, stop: mp.Event):
         for z in db.list_zips_by_status(ZipStatus.PROCESSING):
             name = z["name"]
             prog = db.zip_progress(name)
-            if prog["total"] == 0 or prog["pending"] > 0:
+            if prog["total"] == 0:
+                # zip had no videos to process — release it
+                base = Path(name).stem
+                local_zip = cfg.workdir / "zips" / name
+                ext_dir = cfg.workdir / "extracted" / base
+                if local_zip.exists():
+                    try: local_zip.unlink()
+                    except OSError: pass
+                if ext_dir.exists():
+                    shutil.rmtree(ext_dir, ignore_errors=True)
+                db.set_zip_status(name, ZipStatus.DONE)
+                log.info("cleaned empty zip %s", name)
+                continue
+            if prog["pending"] > 0:
                 continue
             base = Path(name).stem
             local_zip = cfg.workdir / "zips" / name
@@ -167,14 +184,29 @@ def _bootstrap_state(cfg: Config) -> None:
     db = DB(cfg.db_path)
     db.init()
 
+    # sweep stale .part files left from prior crashes
+    n_part = 0
+    for part_file in cfg.output_dir.glob(".*.part.*"):
+        try:
+            part_file.unlink()
+            n_part += 1
+        except OSError:
+            pass
+    if n_part:
+        log.info("removed %d stale .part files", n_part)
+
     log.info("listing remote zips...")
     remote = list_remote_zips()
     log.info("found %d remote zips (%.1f GB total)",
              len(remote), sum(s for _, s in remote) / 1e9)
     db.upsert_zips(remote)
 
-    present = {p.name for p in (cfg.workdir / "zips").rglob("*.zip")}
-    db.reset_stale_zips(zip_files_present=present)
+    # need recursive glob — hf_hub_download writes to local_dir/<repo_path> which includes "chunks/"
+    present_zips = set()
+    for p in (cfg.workdir / "zips").rglob("*.zip"):
+        rel = str(p.relative_to(cfg.workdir / "zips"))
+        present_zips.add(rel)
+    db.reset_stale_zips(zip_files_present=present_zips)
 
 
 def run(cfg: Config) -> None:
@@ -220,11 +252,15 @@ def run(cfg: Config) -> None:
             break
 
     for _ in range(cfg.n_extractors):
-        try: dl_queue.put_nowait(None)
-        except Exception: pass
+        try:
+            dl_queue.put(None, timeout=30)
+        except Exception:
+            log.warning("could not deliver dl_queue sentinel")
     for _ in range(cfg.n_encoders):
-        try: ex_queue.put_nowait(None)
-        except Exception: pass
+        try:
+            ex_queue.put(None, timeout=30)
+        except Exception:
+            log.warning("could not deliver ex_queue sentinel")
 
     for p in procs:
         p.join(timeout=180)

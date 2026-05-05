@@ -1,6 +1,6 @@
 import pytest
 
-from src.encoder import allocate_output_name, decide_action, probe_video, process_video
+from src.encoder import _parse_duration, allocate_output_name, decide_action, probe_video, process_video
 
 
 def test_probe_30fps_no_audio(synthetic_video_factory):
@@ -28,6 +28,28 @@ def test_decide_action(fps, duration, expected):
     assert decide_action(fps=fps, duration=duration) == expected
 
 
+def test_parse_duration_handles_na_and_missing():
+    assert _parse_duration("N/A") == 0.0
+    assert _parse_duration(None) == 0.0
+    assert _parse_duration("") == 0.0
+    assert _parse_duration("3.5") == 3.5
+
+
+def test_allocate_output_name_creates_atomic_placeholder(tmp_path):
+    name = allocate_output_name(tmp_path, "clip.mp4")
+    # placeholder file MUST exist to block concurrent encoders
+    assert (tmp_path / name).exists()
+
+
+def test_allocate_output_name_atomic_under_concurrent_calls(tmp_path):
+    # multiple sequential calls with the same desired name produce distinct outputs
+    names = [allocate_output_name(tmp_path, "clip.mp4") for _ in range(5)]
+    assert len(set(names)) == 5  # all unique
+    assert names[0] == "clip.mp4"
+    for n in names[1:]:
+        assert n.startswith("clip__") and n.endswith(".mp4")
+
+
 def test_allocate_output_name_no_collision(tmp_path):
     name = allocate_output_name(tmp_path, "clip.mp4")
     assert name == "clip.mp4"
@@ -38,7 +60,6 @@ def test_allocate_output_name_with_collision(tmp_path):
     (tmp_path / "clip.txt").write_text("x")
     name = allocate_output_name(tmp_path, "clip.mp4")
     assert name == "clip__1.mp4"
-    (tmp_path / "clip__1.mp4").write_bytes(b"x")
     name2 = allocate_output_name(tmp_path, "clip.mp4")
     assert name2 == "clip__2.mp4"
 

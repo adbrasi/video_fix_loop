@@ -56,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     runp = sub.add_parser("run", help="start the pipeline")
     runp.add_argument("--downloaders", type=int, default=2)
     runp.add_argument("--extractors", type=int, default=2)
-    runp.add_argument("--encoders", type=int, default=int(os.environ.get("VFL_ENCODERS", "32")))
+    runp.add_argument("--encoders", type=int, default=int(os.environ.get("VFL_ENCODERS", "48")))
     runp.set_defaults(func=cmd_run)
 
     sub.add_parser("status", help="print progress").set_defaults(func=cmd_status)

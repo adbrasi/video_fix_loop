@@ -62,3 +62,14 @@ def test_reset_stale_in_progress(tmp_db):
     statuses = {z["name"]: z["status"] for z in db.all_zips()}
     assert statuses["a.zip"] == ZipStatus.PENDING.value
     assert statuses["b.zip"] == ZipStatus.PENDING.value
+
+
+def test_reset_stale_unblocks_downloaded_zip(tmp_db):
+    """A zip stuck in DOWNLOADED (downloader crashed before queueing) must be re-claimed."""
+    db = DB(tmp_db)
+    db.init()
+    db.upsert_zips([("a.zip", 1)])
+    db.set_zip_status("a.zip", ZipStatus.DOWNLOADED)
+    db.reset_stale_zips(zip_files_present={"a.zip"})
+    statuses = {z["name"]: z["status"] for z in db.all_zips()}
+    assert statuses["a.zip"] == ZipStatus.PENDING.value
